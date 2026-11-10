@@ -5,18 +5,20 @@ Writes vuniper-<section>.xml (RSS 2.0 for feed readers) and vuniper-<section>.js
 import json, os, sys, urllib.request, email.utils, datetime
 from xml.sax.saxutils import escape
 
-API = 'https://api.vuniper.workers.dev/?action=GET_MANY_ITEMS_KV&kvName=movies_'
+API = 'https://api.vuniper.com'
 SECTIONS = ('web', 'gems', 'upcoming', 'theaters', 'popular', 'bluray', 'anime', 'top100')
 NAMES = {'web': 'New on digital', 'gems': 'Hidden gems', 'upcoming': 'Upcoming', 'theaters': 'In theaters',
          'popular': 'Popular', 'bluray': 'New on Blu-ray', 'anime': 'Anime', 'top100': 'Top 100'}
 
 def fetch(section):
-    # the API answers 403 without the site's Origin header
-    req = urllib.request.Request(API + section, headers={
-        'Origin': 'https://vuniper.com', 'Referer': 'https://vuniper.com/movies',
+    body = json.dumps({'action': 'GET_MANY_ITEMS_KV', 'kvName': f'movies_{section}', 'url': f'https://vuniper.com/movies/{section}'}).encode()
+    req = urllib.request.Request(API, data=body, method='POST', headers={
+        'Content-Type': 'application/json', 'Origin': 'https://vuniper.com',
+        'Referer': f'https://vuniper.com/movies/{section}',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'})
-    d = json.loads(urllib.request.urlopen(req, timeout=60).read())
-    if not d.get('ok'): raise SystemExit(f'vuniper {section}: {d}')
+    text = urllib.request.urlopen(req, timeout=60).read().decode('utf-8')
+    d, _ = json.JSONDecoder().raw_decode(text.lstrip())
+    if not d.get('ok') or not isinstance(d.get('items'), list): raise SystemExit(f'vuniper {section}: {str(d)[:300]}')
     return d['items']
 
 def rfc822(s):
