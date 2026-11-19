@@ -1,70 +1,100 @@
-"""Vuniper -> RSS + Radarr list. Usage: python vuniper_feed.py [section ...] [--out DIR]
-Sections: web gems upcoming theaters popular bluray anime top100 (default: web)
-Writes vuniper-<section>.xml (RSS 2.0 for feed readers) and vuniper-<section>.json
-(StevenLu format: Radarr > Import Lists > "StevenLu Custom" reads it)."""
-import json, os, sys, urllib.request, email.utils, datetime
+"""Movie feeds -> RSS + Radarr list, from TMDB. Usage: python vuniper_feed.py [section ...] [--out DIR]
+Sections: web bluray theaters upcoming popular anime top100 (default: web)
+Writes vuniper-<section>.xml (RSS 2.0) and vuniper-<section>.json (StevenLu format for Radarr).
+File names stay the same as the old Vuniper version so existing feed links keep working.
+Needs a free TMDB "API Read Access Token" in the TMDB_TOKEN environment variable.
+This product uses the TMDB API but is not endorsed or certified by TMDB."""
+import json, os, sys, urllib.request, urllib.parse, email.utils, datetime
 from xml.sax.saxutils import escape
 
-API = 'https://api.vuniper.com'
-SECTIONS = ('web', 'gems', 'upcoming', 'theaters', 'popular', 'bluray', 'anime', 'top100')
-NAMES = {'web': 'New on digital', 'gems': 'Hidden gems', 'upcoming': 'Upcoming', 'theaters': 'In theaters',
-         'popular': 'Popular', 'bluray': 'New on Blu-ray', 'anime': 'Anime', 'top100': 'Top 100'}
+API = 'https://api.themoviedb.org/3'
+IMG = 'https://image.tmdb.org/t/p/w342'
+REGION = os.environ.get('TMDB_REGION', 'US')
+NAMES = {'web': 'New on digital', 'bluray': 'New on Blu-ray', 'theaters': 'In theaters', 'upcoming': 'Upcoming',
+         'popular': 'Popular', 'anime': 'Anime', 'top100': 'Top 100'}
+TODAY = datetime.date.today()
 
-def fetch(section):
-    body = json.dumps({'action': 'GET_MANY_ITEMS_KV', 'kvName': f'movies_{section}', 'url': f'https://vuniper.com/movies/{section}'}).encode()
-    req = urllib.request.Request(API, data=body, method='POST', headers={
-        'Content-Type': 'application/json', 'Origin': 'https://vuniper.com',
-        'Referer': f'https://vuniper.com/movies/{section}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'})
-    text = urllib.request.urlopen(req, timeout=60).read().decode('utf-8')
-    d, _ = json.JSONDecoder().raw_decode(text.lstrip())
-    if not d.get('ok') or not isinstance(d.get('items'), list): raise SystemExit(f'vuniper {section}: {str(d)[:300]}')
-    return d['items']
+def get(path, **params):
+    token = os.environ.get('TMDB_TOKEN')
+    if not token: raise SystemExit('TMDB_TOKEN is not set (add it as a repository secret)')
+    url = f'{API}{path}?' + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+    return json.loads(urllib.request.urlopen(req, timeout=60).read())
+
+def listing(section):
+    since = (TODAY - datetime.timedelta(days=45)).isoformat()
+    if section in ('web', 'bluray'):  # TMDB release type 4 = digital, 5 = physical
+        return get('/discover/movie', region=REGION, with_release_type=4 if section == 'web' else 5,
+                   **{'release_date.gte': since, 'release_date.lte': TODAY.isoformat()},
+                   sort_by='popularity.desc', include_adult='false', **{'vote_count.gte': 5})['results'][:20]
+    if section == 'anime':
+        return get('/discover/movie', with_genres=16, with_original_language='ja', sort_by='popularity.desc',
+                   **{'primary_release_date.gte': (TODAY - datetime.timedelta(days=365)).isoformat()})['results'][:20]
+    if section == 'top100':
+        return [m for p in range(1, 6) for m in get('/movie/top_rated', region=REGION, page=p)['results']][:100]
+    path = {'theaters': '/movie/now_playing', 'upcoming': '/movie/upcoming', 'popular': '/movie/popular'}[section]
+    return get(path, region=REGION)['results'][:20]
+
+def details(m):
+    return get(f"/movie/{m['id']}", append_to_response='external_ids,release_dates,credits,videos')
+
+def section_date(d, section):
+    want = {'web': 4, 'bluray': 5}.get(section)
+    if want:
+        for r in d.get('release_dates', {}).get('results', []):
+            if r['iso_3166_1'] == REGION:
+                dates = sorted(x['release_date'][:10] for x in r['release_dates'] if x['type'] == want)
+                if dates: return dates[0]
+    return d.get('release_date')
 
 def rfc822(s):
     if not s: return None
-    dt = datetime.datetime.fromisoformat(s.replace('Z', '')).replace(tzinfo=datetime.timezone.utc)
+    dt = datetime.datetime.fromisoformat(s[:10]).replace(tzinfo=datetime.timezone.utc)
     return email.utils.format_datetime(dt)
 
-def item_date(m, section):
-    return m.get(section) if section in ('web', 'bluray') and m.get(section) else m.get('release_date') or m.get('web')
-
-def rss(section, items):
+def rss(section, movies):
     out = ['<?xml version="1.0" encoding="UTF-8"?>', '<rss version="2.0"><channel>',
-           f'<title>Vuniper - {escape(NAMES[section])}</title>', '<link>https://vuniper.com/movies</link>',
-           f'<description>Vuniper movies: {escape(NAMES[section])}</description>',
+           f'<title>Movies - {escape(NAMES[section])}</title>', '<link>https://www.themoviedb.org/movie</link>',
+           f'<description>Movies: {escape(NAMES[section])} (data from TMDB)</description>',
            f'<lastBuildDate>{email.utils.format_datetime(datetime.datetime.now(datetime.timezone.utc))}</lastBuildDate>']
-    for m in items:
-        title = f"{m['title']} ({m.get('year') or '?'})"
-        bits = [f"Score {m['score']} ({m.get('reviews_count') or 0} reviews)" if m.get('score') is not None else '',
-                m.get('genres') or '', m.get('runtime') if (m.get('runtime') or '').startswith(('1', '2', '3')) and 'h' in (m.get('runtime') or '') else '',
-                f"Director: {m['director']}" if m.get('director') else '', f"Cast: {m['actors']}" if m.get('actors') else '']
-        desc = ''.join([f'<img src="{escape(m["img"])}" width="190"/><br/>' if m.get('img') else '',
-                        escape(' | '.join(b for b in bits if b)), '<br/><br/>', escape(m.get('description') or ''),
-                        f'<br/><a href="{escape(m["trailer"])}">Trailer</a>' if m.get('trailer') else ''])
-        link = m.get('imdb_url') or f"https://vuniper.com/?id={m['uid']}"
-        out += ['<item>', f'<title>{escape(title)}</title>', f'<link>{escape(link)}</link>',
-                f'<guid isPermaLink="false">vuniper-{section}-{m["uid"]}</guid>',
-                f'<description><![CDATA[{desc}]]></description>']
-        d = rfc822(item_date(m, section))
-        if d: out.append(f'<pubDate>{d}</pubDate>')
-        for g in (m.get('genres') or '').split(','):
-            if g: out.append(f'<category>{escape(g)}</category>')
+    for d in movies:
+        year = (d.get('release_date') or '?')[:4]
+        genres = ', '.join(g['name'] for g in d.get('genres', []))
+        crew = d.get('credits', {})
+        director = ', '.join(c['name'] for c in crew.get('crew', []) if c.get('job') == 'Director')
+        cast = ', '.join(c['name'] for c in crew.get('cast', [])[:4])
+        rt = d.get('runtime') or 0
+        trailer = next((v for v in d.get('videos', {}).get('results', []) if v.get('site') == 'YouTube' and v.get('type') == 'Trailer'), None)
+        bits = [f"Score {d['vote_average']:.1f} ({d.get('vote_count', 0)} votes)" if d.get('vote_count') else '', genres,
+                f'{rt // 60}h {rt % 60}m' if rt else '', f'Director: {director}' if director else '', f'Cast: {cast}' if cast else '']
+        desc = ''.join([f'<img src="{IMG}{escape(d["poster_path"])}" width="190"/><br/>' if d.get('poster_path') else '',
+                        escape(' | '.join(b for b in bits if b)), '<br/><br/>', escape(d.get('overview') or ''),
+                        f'<br/><a href="https://www.youtube.com/watch?v={escape(trailer["key"])}">Trailer</a>' if trailer else ''])
+        imdb = d.get('external_ids', {}).get('imdb_id') or d.get('imdb_id')
+        link = f'https://www.imdb.com/title/{imdb}/' if imdb else f"https://www.themoviedb.org/movie/{d['id']}"
+        out += ['<item>', f"<title>{escape(d['title'])} ({year})</title>", f'<link>{escape(link)}</link>',
+                f'<guid isPermaLink="false">tmdb-{section}-{d["id"]}</guid>', f'<description><![CDATA[{desc}]]></description>']
+        p = rfc822(section_date(d, section))
+        if p: out.append(f'<pubDate>{p}</pubDate>')
+        out += [f'<category>{escape(g["name"])}</category>' for g in d.get('genres', [])]
         out.append('</item>')
     out.append('</channel></rss>')
     return '\n'.join(out)
 
-def stevenlu(items):
-    return [{'title': m['title'], 'imdb_id': m['imdb_id'], 'poster_url': m.get('img') or ''} for m in items if m.get('imdb_id')]
+def stevenlu(movies):
+    return [{'title': d['title'], 'imdb_id': d['external_ids']['imdb_id'],
+             'poster_url': f"{IMG}{d['poster_path']}" if d.get('poster_path') else ''}
+            for d in movies if d.get('external_ids', {}).get('imdb_id')]
 
-args = sys.argv[1:]
-out_dir = os.path.dirname(os.path.abspath(__file__))
-if '--out' in args:
-    i = args.index('--out'); out_dir = args[i + 1]; del args[i:i + 2]
-os.makedirs(out_dir, exist_ok=True)
-for s in args or ['web']:
-    if s not in SECTIONS: raise SystemExit(f'unknown section {s}; pick from {SECTIONS}')
-    items = fetch(s)
-    open(os.path.join(out_dir, f'vuniper-{s}.xml'), 'w', encoding='utf-8').write(rss(s, items))
-    json.dump(stevenlu(items), open(os.path.join(out_dir, f'vuniper-{s}.json'), 'w', encoding='utf-8'), indent=1, ensure_ascii=False)
-    print(f'{s}: {len(items)} movies -> vuniper-{s}.xml / .json in {out_dir}')
+if __name__ == '__main__':
+    args = sys.argv[1:]
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    if '--out' in args:
+        i = args.index('--out'); out_dir = args[i + 1]; del args[i:i + 2]
+    os.makedirs(out_dir, exist_ok=True)
+    for s in args or ['web']:
+        if s not in NAMES: raise SystemExit(f'unknown section {s}; pick from {tuple(NAMES)}')
+        movies = [details(m) for m in listing(s)]
+        open(os.path.join(out_dir, f'vuniper-{s}.xml'), 'w', encoding='utf-8').write(rss(s, movies))
+        json.dump(stevenlu(movies), open(os.path.join(out_dir, f'vuniper-{s}.json'), 'w', encoding='utf-8'), indent=1, ensure_ascii=False)
+        print(f'{s}: {len(movies)} movies -> vuniper-{s}.xml / .json in {out_dir}')
